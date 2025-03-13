@@ -13,6 +13,7 @@
 #include <vector>
 #include <fstream>
 #include <chrono>  // 시간 측정을 위해 추가
+#include <filesystem>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -540,32 +541,91 @@ public:
     }
 };
 
+// 카메라 관리 클래스
+class BaslerCamera {
+private:
+    CInstantCamera camera;
+    CGrabEventHandler* eventHandler;
+    CImageFormatConverter formatConverter;
+    CPylonImage pylonImage;
 
-int main()
-{
-    unique_ptr<TCPClient> tcpClient;
-    try {
-        // TCP 클라이언트 초기화
-        tcpClient = make_unique<TCPClient>();
-        if (!tcpClient->Connect("127.0.0.1", 8080)) {
-            cerr << "Failed to connect to server" << endl;
-            return -1;
+public:
+    BaslerCamera() : eventHandler(nullptr) {
+        try {
+            PylonInitialize();
+            formatConverter.OutputPixelFormat = PixelType_BGR8packed;
         }
-        cout << "Connected to server successfully" << endl;
+        catch (const GenericException& e) {
+            cerr << "Pylon 초기화 오류: " << e.GetDescription() << endl;
+            throw;
+        }
+    }
 
-        // Basler 카메라 초기화
-        PylonInitialize();
+    ~BaslerCamera() {
+        Disconnect();
+        PylonTerminate();
+    }
 
-        // 카메라 생성 및 연결
-        CInstantCamera camera(CTlFactory::GetInstance().CreateFirstDevice());
-        cout << "Connected to: " << camera.GetDeviceInfo().GetModelName() << endl;
+    void Connect() {
+        try {
+            camera = CInstantCamera(CTlFactory::GetInstance().CreateFirstDevice());
+            cout << "연결된 카메라: " << camera.GetDeviceInfo().GetModelName() << endl;
+            camera.Open();
+            
+            eventHandler = new CGrabEventHandler();
+            camera.RegisterImageEventHandler(eventHandler, RegistrationMode_Append, Cleanup_Delete);
+            
+            ConfigureCamera();
+        }
+        catch (const GenericException& e) {
+            cerr << "카메라 연결 오류: " << e.GetDescription() << endl;
+            throw;
+        }
+    }
 
-        camera.Open();
+    void Disconnect() {
+        if (camera.IsOpen()) {
+            camera.Close();
+        }
+    }
 
-        // 카메라 노드맵 가져오기
+    Mat CaptureImage() {
+        try {
+            CGrabResultPtr ptrGrabResult;
+            camera.GrabOne(INFINITE, ptrGrabResult);
+
+            if (ptrGrabResult->GrabSucceeded()) {
+                auto grabEndTime = high_resolution_clock::now();
+                auto actualGrabDuration = duration_cast<microseconds>(grabEndTime - actualGrabStartTime);
+                cout << "실제 이미지 획득 시간: " << actualGrabDuration.count() / 1000.0 << " ms" << endl;
+                cout << "Line1 트리거로 이미지 캡처됨..." << endl;
+                
+                // 이미지 포맷 변환
+                formatConverter.Convert(pylonImage, ptrGrabResult);
+                Mat capturedImage = ImageProcessor::pylonToMat(pylonImage);
+                
+                pylonImage.Release();
+                return capturedImage;
+            }
+            else {
+                cerr << "이미지 캡처 실패" << endl;
+                return Mat();
+            }
+        }
+        catch (const GenericException& e) {
+            cerr << "캡처 중 Pylon 오류: " << e.GetDescription() << endl;
+            return Mat();
+        }
+        catch (const exception& e) {
+            cerr << "캡처 중 표준 예외: " << e.what() << endl;
+            return Mat();
+        }
+    }
+
+private:
+    void ConfigureCamera() {
         INodeMap& nodeMap = camera.GetNodeMap();
 
-        // 카메라 설정
         // AcquisitionFrameCount 설정
         CIntegerPtr acquisitionFrameCount(nodeMap.GetNode("AcquisitionFrameCount"));
         if (IsAvailable(acquisitionFrameCount)) {
@@ -596,155 +656,175 @@ int main()
             triggerActivation->FromString("FallingEdge");
         }
 
+        // 노출 시간 설정
         CFloatPtr exposureTime(nodeMap.GetNode("ExposureTimeAbs"));
         if (IsAvailable(exposureTime)) {
             exposureTime->SetValue(47000.0);
         }
+    }
+};
 
-        camera.RegisterImageEventHandler(new CGrabEventHandler, RegistrationMode_Append, Cleanup_Delete);
+// 셀 분석 전문 클래스
+class CellAnalyzer {
+private:
+    const string saveDirectory;
 
+public:
+    CellAnalyzer(const string& directory = "C:/GrabImages/") : saveDirectory(directory) {
+        // 저장 디렉토리 확인 및 생성
+        if (!filesystem::exists(saveDirectory)) {
+            filesystem::create_directories(saveDirectory);
+        }
+    }
+    
+    vector<CellAnalysis> AnalyzeROI(const ROIResult& result) {
+        if (!result.success) {
+            cerr << "ROI 추출 실패" << endl;
+            return {};
+        }
+        
+        return result.cellResults;
+    }
+    
+    void SaveResults(const vector<CellAnalysis>& cellResults) {
+        ofstream resultFile(saveDirectory + "analysis_results.txt");
+        
+        for (const auto& cellResult : cellResults) {
+            resultFile << "Cell " << cellResult.cellNumber
+                << ": Object Present = " << (cellResult.hasObject ? "Yes" : "No")
+                << ", Angle = " << cellResult.angle << " degrees"
+                << ", Position = [" << cellResult.bbox.x << ", "
+                << cellResult.bbox.y << ", "
+                << cellResult.bbox.width << ", "
+                << cellResult.bbox.height << "]\n";
 
-        const string saveDirectory = "C:/GrabImages/";
+            cout << "Cell " << cellResult.cellNumber
+                << ": Object Present = " << (cellResult.hasObject ? "Yes" : "No");
 
-        // 이미지 포맷 변환기 설정
-        CImageFormatConverter formatConverter;
-        formatConverter.OutputPixelFormat = PixelType_BGR8packed;
-        CPylonImage pylonImage;
+            if (cellResult.hasObject) {
+                cout << ", Angle = " << cellResult.angle << " degrees";
+            }
+            cout << endl;
+        }
+        resultFile.close();
+    }
+    
+    void SaveImage(const Mat& image, const string& filename) {
+        imwrite(saveDirectory + filename, image);
+    }
+};
 
+// 전체 프로세스 관리 클래스
+class ProcessManager {
+private:
+    unique_ptr<BaslerCamera> camera;
+    unique_ptr<TCPClient> tcpClient;
+    unique_ptr<CellAnalyzer> cellAnalyzer;
+    const string saveDirectory;
+
+public:
+    ProcessManager(const string& directory = "C:/GrabImages/") 
+        : saveDirectory(directory) {
+        camera = make_unique<BaslerCamera>();
+        tcpClient = make_unique<TCPClient>();
+        cellAnalyzer = make_unique<CellAnalyzer>(directory);
+    }
+    
+    void Initialize() {
+        // TCP 서버 연결
+        if (!tcpClient->Connect("127.0.0.1", 8080)) {
+            throw runtime_error("서버 연결 실패");
+        }
+        cout << "서버 연결 성공" << endl;
+        
+        // 카메라 초기화
+        camera->Connect();
+    }
+    
+    void ProcessLoop() {
         while (true) {
-            try {
-                CGrabResultPtr ptrGrabResult;
-                camera.GrabOne(INFINITE, ptrGrabResult);
-
-                if (ptrGrabResult->GrabSucceeded()) {
-                    auto grabEndTime = high_resolution_clock::now();
-                    auto actualGrabDuration = duration_cast<microseconds>(grabEndTime - actualGrabStartTime);
-                    cout << "Actual image acquisition time: " << actualGrabDuration.count() / 1000.0 << " ms" << endl;
-
-                    cout << "Image grabbed by Line1 trigger..." << endl;
-                    cellCount = 0;
-                                     
-                    // 전체 처리 시작 시간 측정
-                    auto totalStartTime = high_resolution_clock::now();
-
-                    // 이미지 포맷 변환 시작 시간
-                    auto convertStartTime = high_resolution_clock::now();
-
-                    // 이미지 포맷 변환 - 단순화된 버전
-                    formatConverter.Convert(pylonImage, ptrGrabResult);
-                    Mat capturedImage = ImageProcessor::pylonToMat(pylonImage);
-
-                    string filename = saveDirectory + "CapturedImage.png";
-                    imwrite(filename, capturedImage);
-
-                    if (!capturedImage.empty()) {
-                        // 이미지 변환 완료 시간 측정
-                        auto convertEndTime = high_resolution_clock::now();
-                        auto convertDuration = duration_cast<milliseconds>(convertEndTime - convertStartTime);
-                        cout << "Image conversion time: " << convertDuration.count() << " ms" << endl;
-
-                        // ROI 추출 시작 시간
-                        auto roiStartTime = high_resolution_clock::now();
-
-                        // ROI 추출 및 분석
-                        ROIResult result = ImageProcessor::extractWhitePlateROI(capturedImage);
-
-                        // ROI 추출 완료 시간 측정
-                        auto roiEndTime = high_resolution_clock::now();
-                        auto roiDuration = duration_cast<milliseconds>(roiEndTime - roiStartTime);
-                        cout << "ROI extraction time: " << roiDuration.count() << " ms" << endl;
-
-                        if (result.success) {
-                            cout << "ROI extraction successful" << endl;
-
-                            // 셀 분석 결과 저장
-                            ofstream resultFile(saveDirectory + "analysis_results.txt");
-
-                            // 전체 셀 분석 시작 시간 측정
-                            auto cellsStartTime = high_resolution_clock::now();
-
-                            // 셀 분석 결과
-                            int totalCells = result.cellResults.size();
-                            cout << "\nAnalyzing " << totalCells << " cells..." << endl;
-
-                            for (const auto& cellResult : result.cellResults) {
-                                resultFile << "Cell " << cellResult.cellNumber
-                                    << ": Object Present = " << (cellResult.hasObject ? "Yes" : "No")
-                                    << ", Angle = " << cellResult.angle << " degrees"
-                                    << ", Position = [" << cellResult.bbox.x << ", "
-                                    << cellResult.bbox.y << ", "
-                                    << cellResult.bbox.width << ", "
-                                    << cellResult.bbox.height << "]\n";
-
-                                cout << "Cell " << cellResult.cellNumber
-                                    << ": Object Present = " << (cellResult.hasObject ? "Yes" : "No");
-
-                                if (cellResult.hasObject) {
-                                    cout << ", Angle = " << cellResult.angle << " degrees";
-                                }
-                                cout << endl;
-                            }
-                            resultFile.close();
-
-                            // 전체 셀 분석 완료 시간 측정
-                            auto cellsEndTime = high_resolution_clock::now();
-                            auto cellsDuration = duration_cast<milliseconds>(cellsEndTime - cellsStartTime);
-                            cout << "\nTotal cells processing time: " << cellsDuration.count() << " ms" << endl;
-
-                            // 전체 처리 완료 시간 측정
-                            auto totalEndTime = high_resolution_clock::now();
-                            auto totalDuration = duration_cast<microseconds>(totalEndTime - totalStartTime);
-                            cout << "\nTotal processing time: " << totalDuration.count() << " microseconds ("
-                                << fixed << setprecision(3) << totalDuration.count() / 1000.0 << " ms)" << endl;
-
-                            string message = "Image processed successfully";
-
-                            if (tcpClient->SendMessage(message)) {
-                                cout << "Message sent to server" << endl;
-                            }
-                            else {
-                                cerr << "Failed to send message to server" << endl;
-                            }
-                        }
-                        else {
-                            cerr << "ROI extraction failed" << endl;
-                        }
-                    }
-                    else {
-                        cerr << "Failed to load captured image" << endl;
-                    }
-
-                    pylonImage.Release();
+            cellCount = 0;  // 글로벌 변수 초기화
+            
+            // 전체 처리 시작 시간 측정
+            auto totalStartTime = high_resolution_clock::now();
+            
+            // 이미지 캡처
+            auto convertStartTime = high_resolution_clock::now();
+            Mat capturedImage = camera->CaptureImage();
+            
+            if (capturedImage.empty()) {
+                cerr << "캡처된 이미지를 로드할 수 없음" << endl;
+                continue;
+            }
+            
+            cellAnalyzer->SaveImage(capturedImage, "CapturedImage.png");
+            
+            auto convertEndTime = high_resolution_clock::now();
+            auto convertDuration = duration_cast<milliseconds>(convertEndTime - convertStartTime);
+            cout << "이미지 변환 시간: " << convertDuration.count() << " ms" << endl;
+            
+            // ROI 추출 및 분석
+            auto roiStartTime = high_resolution_clock::now();
+            ROIResult result = ImageProcessor::extractWhitePlateROI(capturedImage);
+            auto roiEndTime = high_resolution_clock::now();
+            auto roiDuration = duration_cast<milliseconds>(roiEndTime - roiStartTime);
+            cout << "ROI 추출 시간: " << roiDuration.count() << " ms" << endl;
+            
+            if (result.success) {
+                cout << "ROI 추출 성공" << endl;
+                
+                // 셀 분석 결과 처리
+                auto cellsStartTime = high_resolution_clock::now();
+                vector<CellAnalysis> cellResults = cellAnalyzer->AnalyzeROI(result);
+                
+                cout << "\n" << cellResults.size() << "개 셀 분석 중..." << endl;
+                cellAnalyzer->SaveResults(cellResults);
+                
+                auto cellsEndTime = high_resolution_clock::now();
+                auto cellsDuration = duration_cast<milliseconds>(cellsEndTime - cellsStartTime);
+                cout << "\n전체 셀 처리 시간: " << cellsDuration.count() << " ms" << endl;
+                
+                // 전체 처리 완료 시간 측정
+                auto totalEndTime = high_resolution_clock::now();
+                auto totalDuration = duration_cast<microseconds>(totalEndTime - totalStartTime);
+                cout << "\n전체 처리 시간: " << totalDuration.count() << " 마이크로초 ("
+                    << fixed << setprecision(3) << totalDuration.count() / 1000.0 << " ms)" << endl;
+                
+                // 결과 전송
+                string message = "이미지 처리 성공";
+                if (tcpClient->SendMessage(message)) {
+                    cout << "서버에 메시지 전송됨" << endl;
                 }
                 else {
-                    cerr << "Failed to grab image" << endl;
+                    cerr << "서버에 메시지 전송 실패" << endl;
                 }
             }
-            catch (const GenericException& e) {
-                cerr << "Pylon error during grab: " << e.GetDescription() << endl;
-            }
-            catch (const exception& e) {
-                cerr << "Standard exception during grab: " << e.what() << endl;
+            else {
+                cerr << "ROI 추출 실패" << endl;
             }
         }
-
-        // 카메라 정리
-        if (camera.IsOpen()) {
-            camera.Close();
-        }
     }
-    catch (const GenericException& e) {
-        cerr << "Pylon error: " << e.GetDescription() << endl;
-    }
-    catch (const exception& e) {
-        cerr << "Standard exception: " << e.what() << endl;
-    }
-
-    // 리소스 정리
-    if (tcpClient) {
+    
+    void Cleanup() {
+        camera->Disconnect();
         tcpClient->Disconnect();
     }
+};
 
-    PylonTerminate();
+int main()
+{
+    try {
+        ProcessManager processManager;
+        processManager.Initialize();
+        processManager.ProcessLoop();
+        processManager.Cleanup();
+    }
+    catch (const GenericException& e) {
+        cerr << "Pylon 오류: " << e.GetDescription() << endl;
+    }
+    catch (const exception& e) {
+        cerr << "표준 예외: " << e.what() << endl;
+    }
+
     return 0;
 }
